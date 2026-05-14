@@ -1,0 +1,78 @@
+# ── Stage 1: Composer dependencies + optimized autoload ──
+FROM composer:2 AS vendor
+
+WORKDIR /app
+
+COPY composer.json composer.lock ./
+
+RUN composer install \
+    --no-interaction \
+    --no-scripts \
+    --prefer-dist
+
+# Copy full source to rebuild classmap with all application classes
+COPY . .
+
+RUN composer dump-autoload --optimize --no-scripts
+
+# ── Stage 2: PHP-FPM runtime ──
+FROM php:8.4-fpm-alpine
+
+RUN apk add --no-cache \
+    libzip-dev \
+    libpng-dev \
+    libjpeg-turbo-dev \
+    freetype-dev \
+    icu-dev \
+    postgresql-dev \
+    && docker-php-ext-configure gd --with-freetype --with-jpeg \
+    && docker-php-ext-install -j$(nproc) \
+    pdo \
+    pdo_pgsql \
+    pgsql \
+    zip \
+    pcntl \
+    gd \
+    intl \
+    opcache \
+    && apk add --no-cache --virtual .phpize-deps $PHPIZE_DEPS \
+    && pecl install redis \
+    && docker-php-ext-enable redis \
+    && apk del .phpize-deps \
+    && rm -rf /var/cache/apk/*
+
+# PHP production config
+RUN mv "$PHP_INI_DIR/php.ini-production" "$PHP_INI_DIR/php.ini"
+COPY docker/php/uploads.ini /usr/local/etc/php/conf.d/uploads.ini
+
+# OPcache settings
+RUN echo "opcache.enable=1" >> /usr/local/etc/php/conf.d/opcache.ini \
+    && echo "opcache.memory_consumption=128" >> /usr/local/etc/php/conf.d/opcache.ini \
+    && echo "opcache.interned_strings_buffer=8" >> /usr/local/etc/php/conf.d/opcache.ini \
+    && echo "opcache.max_accelerated_files=10000" >> /usr/local/etc/php/conf.d/opcache.ini \
+    && echo "opcache.validate_timestamps=0" >> /usr/local/etc/php/conf.d/opcache.ini
+
+WORKDIR /var/www/html
+
+# Copy application code
+COPY --chown=www-data:www-data . .
+
+# Copy vendor from composer stage
+COPY --from=vendor --chown=www-data:www-data /app/vendor ./vendor
+
+# Clear dev bootstrap cache and discover packages
+RUN rm -f bootstrap/cache/*.php \
+    && php artisan package:discover --ansi
+
+# Create storage directories
+RUN mkdir -p storage/framework/{sessions,views,cache} \
+    && chown -R www-data:www-data storage bootstrap/cache
+
+COPY docker/entrypoint.prod.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+USER www-data
+
+EXPOSE 9000
+
+CMD ["/usr/local/bin/entrypoint.sh"]
